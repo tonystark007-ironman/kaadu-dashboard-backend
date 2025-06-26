@@ -6,6 +6,10 @@ import pandas as pd
 import io
 from datetime import datetime, date
 import re # Import regex module for standardize_category_name
+import logging # Import logging module
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize the FastAPI app
 app = FastAPI()
@@ -29,450 +33,438 @@ df_store = {}
 # Function to standardize category names
 def standardize_category_name(product_name):
     """
-    Extracts the first word of a product name and maps similar words to a standard category.
-    This helps in grouping similar products under one main category.
-    You can extend this mapping as needed.
+    Extracts the first meaningful word from a product name and capitalizes it as the category.
+    This provides a simpler, direct categorization based on the initial part of the product name.
+    It also includes a small map for common aliases or plural forms to ensure consistency.
     """
     if pd.isna(product_name) or not isinstance(product_name, str) or not product_name.strip():
-        return "Other" # Default category for empty or invalid product names
+        logging.info(f"Product name '{product_name}' is invalid or empty, returning 'Other'.")
+        return "Other"
 
-    # Split by space, underscore, or hyphen to get initial keyword
-    first_word = re.split(r'[ _-]', product_name.strip())[0]
+    product_name_lower = product_name.lower().strip()
+    logging.info(f"Standardizing category for product: '{product_name}'")
 
-    # Define a mapping for similar categories to a single main category
-    category_mapping = {
+    # Define common prefixes or words to ignore if they appear at the very beginning
+    ignore_prefixes = [
+        r'^(?:kaadu\s+organics?|pure|organic|fresh|premium|natural|indian|farm|garden|daily)\s*',
+        r'^\d+\s*(?:kg|g|gm|ml|l|liter|pack|pkt|piece|pc|units?|bottles?)\s*' # Ignore leading quantity/unit
+    ]
+
+    cleaned_name = product_name_lower
+    for prefix_pattern in ignore_prefixes:
+        cleaned_name = re.sub(prefix_pattern, '', cleaned_name).strip()
+
+    # Split by space, underscore, or hyphen to get the first significant word
+    # Only split by the first occurrence of these delimiters to preserve multi-word names
+    # e.g., "Rice - Aathur Kichali Samba" -> "Rice"
+    parts = re.split(r'[ _-]', cleaned_name, 1) # Split only once
+
+    first_word = parts[0].strip() if parts else "Other"
+
+    # Minimal explicit mapping for common aliases or pluralization
+    simple_category_map = {
         "jaggery": "Jaggery",
         "rice": "Rice",
         "dal": "Dal",
-        "oil": "Oils",      # Adjusted for 'oil' to map to 'Oils'
+        "oil": "Oils",      # Alias for 'oils'
         "oils": "Oils",
+        "millet": "Millets", # Singular to plural
         "millets": "Millets",
+        "spice": "Spices",   # Singular to plural
         "spices": "Spices",
         "flour": "Flour",
-        "atta": "Flour", # Mapping atta to Flour
+        "atta": "Flour",
         "honey": "Honey",
         "ghee": "Ghee",
         "powder": "Powder",
         "soap": "Soap",
         "sugar": "Sugar",
         "salt": "Salt",
+        "nut": "Nuts",       # Singular to plural
         "nuts": "Nuts",
         "tea": "Tea",
         "coffee": "Coffee",
+        "grain": "Grains",   # Singular to plural
         "grains": "Grains",
-        "cereals": "Grains",
+        "cereal": "Cereals", # Singular to plural
+        "cereals": "Cereals",
+        "seed": "Seeds",     # Singular to plural
         "seeds": "Seeds",
+        "snack": "Snacks",   # Singular to plural
         "snacks": "Snacks",
+        "sweet": "Sweets",   # Singular to plural
         "sweets": "Sweets",
+        "herb": "Herbs",     # Singular to plural
         "herbs": "Herbs",
-        "drinks": "Drinks",
-        "beverages": "Drinks",
-        "vegetables": "Vegetables",
-        "fruits": "Fruits",
-        "dairy": "Dairy",
-        "bread": "Bakery",
-        "bakery": "Bakery",
-        "meat": "Meat & Fish",
-        "fish": "Meat & Fish",
-        "cosmetics": "Cosmetics", # Added as per frontend colors
-        "personal": "Personal Care", # Added as per frontend colors (e.g., "Personal Hygiene")
+        "cosmetic": "Cosmetics", # Singular to plural
+        "cosmetics": "Cosmetics",
+        "personal": "Personal Care", # For "Personal Care"
+        "mix": "Mixes",
+        "shipping": "Shipping",
+        "miscellaneous": "Miscellaneous",
+        "poha": "Rice Products",
+        "aval": "Rice Products",
+        "paneer": "Dairy & Cheese",
+        "dates": "Fruits & Dry Fruits",
     }
+    
+    # Use the mapping if an exact match for the first word is found, otherwise capitalize it
+    category = simple_category_map.get(first_word, first_word.capitalize())
+    if not category: # Fallback if first_word was empty after cleaning
+        category = "Other"
 
-    # Convert to lowercase for consistent mapping
-    first_word_lower = first_word.lower()
+    logging.info(f"Categorized '{product_name}' as '{category}' using first meaningful word/map.")
+    return category
 
-    # Return the standardized category, or capitalize the first word if no specific mapping exists
-    return category_mapping.get(first_word_lower, first_word.capitalize() if first_word else "Other")
-
-
-@app.get("/")
-async def read_root():
+# Function to extract variety from product names
+def extract_variety(product_name, category_name):
     """
-    Root endpoint for a simple health check.
+    Extracts the specific variety from a product name after the main category is identified.
+    It attempts to remove the category name and common suffixes like 'Raw', 'Boiled', 'Full Skin'
+    to isolate the true variety descriptor.
     """
-    return {"message": "Welcome to the Dashboard Backend! Upload a CSV file."}
+    if pd.isna(product_name) or not isinstance(product_name, str):
+        return "Unknown"
+
+    product_name_lower = product_name.lower().strip()
+    category_name_lower = category_name.lower().strip()
+    logging.info(f"Extracting variety for '{product_name}' (Category: {category_name})")
+
+    # 1. Remove the main category word (and common aliases/variations) from the start of the product name.
+    # This regex is designed to catch "Category - Variety", "Category_Variety", "Category Variety"
+    # It accounts for possible "s" at the end of category if product name uses singular form.
+    # Make sure to handle categories that are multiple words too if they were mapped that way (e.g., "Rice Products")
+    
+    # Generate a more dynamic pattern for category removal based on the actual category name and its singular/plural forms
+    category_forms = [re.escape(category_name_lower)]
+    if category_name_lower.endswith('s'):
+        category_forms.append(re.escape(category_name_lower[:-1])) # e.g., 'oils' -> 'oil'
+    else:
+        category_forms.append(re.escape(category_name_lower + 's')) # e.g., 'rice' -> 'rices' (though 'rices' is less common)
+    
+
+    # Create a single regex pattern to match any of the category forms at the beginning
+    category_removal_pattern = r'^(?:' + '|'.join(category_forms) + r')(?:\s*[-_:]?\s*)?'
+    
+    variety_part = re.sub(category_removal_pattern, '', product_name_lower).strip()
+
+    # If the variety_part is empty after initial removal, try a less aggressive removal
+    # This can happen if the product name is just the category (e.g., "Jaggery")
+    if not variety_part and product_name_lower == category_name_lower:
+        logging.info(f"Product name is just the category '{product_name}'. Returning 'Standard'.")
+        return "Standard" # No specific variety if product name is just its category
+
+    # 2. Remove common generic descriptors/suffixes from the *end* or middle that are not part of the variety.
+    generic_descriptors_to_remove = [
+        r'\s*[-_:]?\s*(?:raw|boiled|full skin|semi skin|scented)\s*$', # End of string processing
+        r'\s*\d+(?:\.\d+)?\s*(?:kg|g|gm|ml|l|liter|pack|pkt|piece|pc|units?|bottles?)\s*$', # Units at end
+        r'\s*(?:kaadu|organic|pure|fresh|premium|natural|indian|farm|garden|daily)\b\s*' # Generic brand/quality words
+    ]
+
+    for pattern in generic_descriptors_to_remove:
+        variety_part = re.sub(pattern, ' ', variety_part).strip()
+    
+    # Remove any remaining extra spaces
+    variety_part = re.sub(r'\s+', ' ', variety_part).strip()
+
+    if variety_part:
+        # Capitalize each word for cleaner presentation
+        variety = ' '.join([word.title() for word in variety_part.split()])
+        logging.info(f"Extracted variety: '{variety}' for product '{product_name}'.")
+        return variety
+    
+    logging.info(f"Variety for '{product_name}' (Category: {category_name}) could not be specifically extracted, returning 'Generic Variety'.")
+    return "Generic Variety"
+
+# Function to extract pack size label and its derived numeric value
+def extract_pack_size(product_name):
+    """
+    Extracts the pack size (e.g., 1kg, 500g, 2L, 10 Pcs) and its derived numeric value from a product name.
+    Prioritizes common units.
+    """
+    if pd.isna(product_name) or not isinstance(product_name, str):
+        logging.info(f"Pack size extraction: Product name '{product_name}' is invalid or empty, returning 'Unknown', 0.0.")
+        return "Unknown", 0.0
+
+    product_name_lower = product_name.lower()
+    logging.info(f"Extracting pack size for product: '{product_name}' (lower: '{product_name_lower}')")
+
+    # Regex to find numbers (integers or floats) followed by common weight/volume/count units
+    # This pattern is robust for various number formats (e.g., 0.5kg, 1kg, 2.5l)
+    # Added "pkt" and "box" explicitly, and ensured "pack" captures "pack of X"
+    match = re.search(r'(\d+(?:\.\d+)?)\s*(kg|g|gm|ml|l|liter|pc|pkt|pack(?:s)?|box(?:es)?|units?)', product_name_lower)
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2)
+
+        # Standardize units and convert to a base unit (e.g., kg for weight, liter for volume, 'count' for discrete items)
+        if unit in ['kg', 'liter', 'l']:
+            logging.info(f"Extracted pack size: {value}{unit} (Derived: {value})")
+            return f"{value}{unit}", value # Return value as is (e.g., 1.0 for 1kg/1L)
+        elif unit in ['g', 'gm']:
+            converted_value = value / 1000.0
+            logging.info(f"Extracted pack size: {value}{unit} (Derived: {converted_value})")
+            return f"{value}{unit}", converted_value # Convert grams to kg (e.g., 0.5 for 500g)
+        elif unit == 'ml':
+            converted_value = value / 1000.0
+            logging.info(f"Extracted pack size: {value}{unit} (Derived: {converted_value})")
+            return f"{value}{unit}", converted_value # Convert ml to liters (e.g., 0.25 for 250ml)
+        elif unit in ['pc', 'pkt', 'pack', 'packs', 'box', 'boxes', 'unit', 'units']:
+            logging.info(f"Extracted pack size: {int(value)} {unit.replace('s', '')} (Derived: {value})")
+            return f"{int(value)} {unit.replace('s', '')}", value # Return as is for count-based units, integer for label, singular unit
+    
+    # Handle cases like "x2", "pack of 4" where unit is implied or less explicit
+    count_match = re.search(r'(?:x|pack of|set of)\s*(\d+)', product_name_lower)
+    if count_match:
+        value = float(count_match.group(1))
+        logging.info(f"Extracted count-based pack size: {int(value)} Count (Derived: {value})")
+        return f"{int(value)} Count", value # Treat as unit count
+
+    # If no specific size/unit found, assume it's a "Standard Pack" or "Single Item"
+    # Assign a derived_unit_value of 1.0 for calculation consistency
+    logging.info(f"Pack size for '{product_name}' extracted as 'Standard Pack', derived value 1.0.")
+    return "Standard Pack", 1.0
 
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile = File(...)):
-    """
-    Endpoint to handle CSV file uploads.
-    Parses the CSV content into a Pandas DataFrame, creates a 'category' column
-    based on the 'Product' column, and standardizes category names.
-    Now more robust to variations in column names and presence of optional columns.
-    """
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are allowed.")
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file format. Only CSV files are allowed.")
 
     try:
-        contents = await file.read()
-        data = io.StringIO(contents.decode("utf-8"))
+        content = await file.read()
+        df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+        logging.info(f"Initial CSV columns: {df.columns.tolist()}")
 
-        # Define the expected columns and their possible variations, mapping to internal names
-        # Format: {'internal_name': ['Possible CSV Column Name 1', 'Possible CSV Column Name 2']}
-        column_mapping = {
-            "date": ["Date", "Sale Date", "Transaction Date", "Order Date", "Invoice Date"],
-            "product": ["Product", "Product Name", "Item", "Item Name", "Description"], # Added "Description"
-            "unit": ["Unit", "UOM", "Measurement Unit", "Unit Of Measure"],
-            "sales": ["Amount", "Sale Amount", "Total Price", "Revenue", "Total Sales", "Net Amount"], # Added more variations
-            "quantity": ["Quantity", "Qty", "Units Sold", "Num Units"], # Added more variations
-            "price_per_unit": ["Price/Unit", "Price / Unit", "Price/UOM", "Rate", "Unit Price"], # Added "Unit Price"
-            "invoice_no": ["Invoice No.", "Invoice No", "Invoice Number", "Bill No", "Bill Number"], # Added more variations
-            "party_name": ["Party Name", "Party", "Customer Name", "Customer"], # Added "Customer"
-            "item_code": ["Item code", "Item Code", "Product Code", "SKU"], # Added "SKU"
-            "hsn_sac": ["HSN/SAC", "HSN Code", "SAC Code", "HSN"], # Added "HSN"
-            "discount": ["Discount", "Discount Amount", "Disc."],
-            "tax": ["Tax", "Tax Amount", "VAT", "GST"],
-            "store_name": ["Store", "Store Name", "Location", "Branch"],
-            "customer_id": ["Customer ID", "CustomerID", "Customer Identifier", "Client ID"],
-            "payment_method": ["Payment Method", "PaymentType", "Method of Payment", "Payment Mode"],
+        # Expected columns (case-insensitive and flexible)
+        required_cols_map = {
+            'date': ['date', 'order date', 'transaction date'],
+            'product': ['product', 'product name', 'item'],
+            'quantity': ['quantity', 'qty', 'units'],
+            'sales': ['sales', 'revenue', 'amount'],
+            'unit': ['unit', 'uom', 'measure'] # Optional, but good to have for advanced analysis
         }
+
+        # Rename columns to standardized names
+        df_cols = [col.lower() for col in df.columns]
+        standard_df_cols = {}
+        for standard_name, possible_names in required_cols_map.items():
+            found = False
+            for p_name in possible_names:
+                if p_name in df_cols:
+                    df.rename(columns={df.columns[df_cols.index(p_name)]: standard_name}, inplace=True)
+                    standard_df_cols[standard_name] = True
+                    found = True
+                    break
+            # Modified: 'quantity' is no longer strictly mandatory at upload
+            if not found and standard_name in ['date', 'product', 'sales']: # Make core columns mandatory
+                logging.error(f"Missing required column: {standard_name}. Please ensure your CSV has one of: {', '.join(possible_names)}.")
+                raise HTTPException(status_code=400, detail=f"Missing required column: {standard_name}. Please ensure your CSV has one of: {', '.join(possible_names)}.")
         
-        # Read the CSV, skipping bad lines for robustness
-        df = pd.read_csv(data, on_bad_lines='skip')
-        print(f"Initial CSV columns: {df.columns.tolist()}")
+        logging.info(f"Columns after initial mapping: {df.columns.tolist()}")
 
-        # Identify actual columns from the CSV that match our expected list (case-insensitive)
-        found_columns_map = {}
-        df_lower_cols = {col.lower(): col for col in df.columns} # Map lowercased col to original col name
+        # Ensure numeric types for quantity and sales
+        # Use .get() for 'quantity' to safely handle its absence
+        if 'quantity' in df.columns:
+            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0)
+            logging.info("Quantity column processed.")
+        else:
+            df['quantity'] = 0 # Add a quantity column with default 0 if it was missing
+            logging.info("Quantity column not found in CSV. Added with default value 0.")
+
+        df['sales'] = pd.to_numeric(df['sales'], errors='coerce').fillna(0)
+        logging.info("Sales column processed.")
+
+
+        # Convert 'date' column to datetime objects
+        # Try multiple date formats for robustness
+        df['date'] = pd.to_datetime(df['date'], errors='coerce', infer_datetime_format=True)
+        if df['date'].isnull().all():
+            logging.error("Date column could not be parsed.")
+            raise HTTPException(status_code=400, detail="Date column could not be parsed. Please ensure dates are in a recognizable format (e.g.,YYYY-MM-DD, MM/DD/YYYY).")
         
-        for internal_name, possible_names in column_mapping.items():
-            for possible_name in possible_names:
-                if possible_name.lower() in df_lower_cols:
-                    found_columns_map[df_lower_cols[possible_name.lower()]] = internal_name
-                    break # Found a match, move to the next internal name
-
-        # Create a new DataFrame with only the found columns and their standardized names
-        df_processed = pd.DataFrame()
-        for original_col, new_col in found_columns_map.items():
-            df_processed[new_col] = df[original_col]
-        df = df_processed # Replace original df with the processed one
-        print(f"Columns after initial mapping: {df.columns.tolist()}")
-
-        # Define which internal names are absolutely required for basic functionality
-        # Removed 'quantity' from required columns
-        required_internal_columns = ["date", "product", "sales"] 
-        missing_required = [col for col in required_internal_columns if col not in df.columns]
-        if missing_required:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing critical columns after parsing: {', '.join(missing_required)}. "
-                       f"Please ensure your CSV contains variants of these (e.g., 'Date', 'Product', 'Amount'). "
-                       f"Available columns in processed file: {', '.join(df.columns.tolist())}"
-            )
-        
-        # Handle optional columns: if not found, add them with a default value
-        # This loop now covers ALL possible internal names from column_mapping
-        for internal_name in column_mapping.keys():
-            if internal_name not in df.columns:
-                # Assign sensible defaults based on expected type
-                if internal_name in ["sales", "quantity", "discount", "tax", "price_per_unit"]:
-                    df[internal_name] = 0.0 # Numeric default
-                else: # For other string-based optional columns
-                    df[internal_name] = "N/A" # String default
-                print(f"Note: '{internal_name}' column not found in CSV. Added with default values.")
+        # Drop rows where essential data (date, product, sales) is missing after coercion
+        # Quantity is now optional for dropping subset, as it defaults to 0
+        df.dropna(subset=['date', 'product', 'sales'], inplace=True)
+        logging.info(f"DataFrame after dropping rows with missing essential data: {len(df)} rows.")
 
 
-        # --- START: Robust parsing logic for Discount and GST values ---
-        # Apply regex to extract only the numeric part before parentheses for 'discount' and 'tax'
-        for col_name in ["discount", "tax"]:
-            if col_name in df.columns and df[col_name].dtype == 'object': # Only process if it's a string/object column
-                # Use a regex to find numbers that might be followed by parentheses
-                # This will extract "1.20" from "1.20(15.0%)"
-                # The regex looks for an optional hyphen, then one or more digits, an optional decimal point, and zero or more digits.
-                df[col_name] = df[col_name].astype(str).str.extract(r'^(-?\d+\.?\d*)', expand=False)
-                print(f"Note: Applied regex extraction to '{col_name}' column.")
-        # --- END: Robust parsing logic for Discount and GST values ---
-
-        # Ensure numeric columns are indeed numeric AFTER any string manipulations (like regex extraction)
-        # Include all columns that *could* be numeric and convert them
-        numeric_cols = ["sales", "quantity", "discount", "tax", "price_per_unit"]
-        for col in numeric_cols:
-            if col in df.columns: # Check if the column exists after optional column handling
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                print(f"Converted '{col}' to numeric, filled NaNs with 0.")
-            else:
-                # This case should ideally be caught by the "Handle optional columns" block above,
-                # but as a failsafe, ensure it's numeric if added later.
-                df[col] = 0.0
-                print(f"Warning: '{col}' not found, set to 0.0 (failsafe).")
-
-        # Convert 'date' column to datetime objects with multiple format attempts
-        # First, ensure 'date' column is treated as string before parsing to avoid issues with mixed types
-        df['date'] = df['date'].astype(str)
-        initial_valid_dates = df['date'].notna().sum()
-        date_formats_to_try = [
-            '%d-%m-%Y',    # e.g., 21-06-2025
-            '%Y-%m-%d',    # e.g., 2025-06-21
-            '%m/%d/%Y',    # e.g., 06/21/2025
-            '%d/%m/%Y',    # e.g., 21/06/2025
-            '%Y/%m/%d',    # e.g., 2025/06/21
-            '%d-%m-%y',    # e.g., 21-06-25 (two-digit year)
-            '%m/%d/%y',    # e.g., 06/21/25 (two-digit year)
-            '%d %b %Y',    # e.g., 21 Jun 2025
-            '%d %B %Y'     # e.g., 21 June 2025
-        ]
-        
-        original_date_series = df['date'].copy() # Preserve original for retries
-        
-        parsed_successfully = False
-        for fmt in date_formats_to_try:
-            df['date'] = pd.to_datetime(original_date_series, format=fmt, errors='coerce')
-            if df['date'].notna().sum() > 0: # Check if any dates were successfully parsed with this format
-                print(f"Successfully parsed dates with format: '{fmt}'. Valid dates: {df['date'].notna().sum()}")
-                parsed_successfully = True
-                break
-        
-        # If specific formats didn't work and there were non-null dates initially, try general inference
-        if not parsed_successfully and initial_valid_dates > 0:
-            df['date'] = pd.to_datetime(original_date_series, errors='coerce', infer_datetime_format=True)
-            if df['date'].notna().sum() > 0:
-                print(f"Successfully parsed dates with inferred format. Valid dates: {df['date'].notna().sum()}")
-            else:
-                print("Warning: Date parsing failed even with inference. All dates might be invalid.")
-        
-        # If after all attempts, the 'date' column is still all NaT (Not a Time), raise an error
-        # Now, if 'date' is fully unparseable AND was initially present, raise error. If 'date' wasn't there, it would be N/A and then set to default.
-        if df['date'].isnull().all() and initial_valid_dates > 0:
-             raise HTTPException(
-                status_code=400,
-                detail="Date column could not be parsed into a valid date format. Please check date format in your CSV."
-            )
-
-        df.dropna(subset=['date'], inplace=True) # Drop rows where date parsing ultimately failed
-        print(f"DataFrame after date processing and dropping NaNs: {len(df)} rows.")
+        # Generate 'month_year' for monthly trends
+        df['month_year'] = df['date'].dt.to_period('M').astype(str)
+        logging.info("Month_year column generated.")
 
 
-        # Create 'category' column by taking the first word of 'product' and standardizing it
-        # Ensure 'product' column is string type before applying standardize_category_name
-        df['product'] = df['product'].astype(str)
+        # Add 'category' column based on product name standardization
         df['category'] = df['product'].apply(standardize_category_name)
-        print("Note: 'category' column created and standardized based on 'product'.")
+        logging.info("Category column added and standardized.")
 
         # Ensure 'unit' column exists and is string type
         if 'unit' not in df.columns:
             df['unit'] = "units" # Default unit if not present
+            logging.info("Unit column not found in CSV. Added with default 'units'.")
         df['unit'] = df['unit'].astype(str).fillna("units") # Ensure it's string and fill NaN with default
+        logging.info("Unit column processed.")
+
+        # Store DataFrame globally for subsequent queries
+        df_store['data'] = df # IMPORTANT: This key 'data' is the one used by get_current_df() below.
         
-        # Ensure 'store_name' column exists and is string type
-        if 'store_name' not in df.columns:
-            df['store_name'] = "N/A" # Default store name if not present
-        df['store_name'] = df['store_name'].astype(str).fillna("N/A")
+        # Get unique categories and products for dropdowns
+        categories = sorted(df['category'].dropna().unique().tolist())
+        products = sorted(df['product'].dropna().unique().tolist())
 
-        # Store the DataFrame in our in-memory store
-        df_store["current_dashboard_data"] = df
-        print(f"Successfully uploaded and parsed: {file.filename}")
-        print(f"DataFrame Head:\n{df.head()}")
-        print(f"DataFrame Info:\n{df.info()}")
-        print(f"Final DataFrame Columns: {df.columns.tolist()}")
+        logging.info(f"CSV uploaded and processed. Categories found: {categories}, Products found: {products}")
 
-        # Return unique standardized categories, products, and store names to the frontend
-        categories = df["category"].unique().tolist()
-        products = df["product"].unique().tolist()
-        store_names = df["store_name"].unique().tolist() if "store_name" in df.columns else []
+        return {"message": "CSV uploaded and processed successfully!",
+                "rows_processed": len(df),
+                "categories": categories,
+                "products": products}
 
-        # Before returning, ensure 'quantity' is treated correctly if it was missing
-        # The frontend expects total_quantity. If 'quantity' was missing, its sum will be 0 due to fillna(0)
-        # So we can calculate total_quantity here based on the processed df.
-        total_quantity_calculated = df["quantity"].sum() if "quantity" in df.columns else 0.0
-        total_sales_calculated = df["sales"].sum() if "sales" in df.columns else 0.0
-
-        return {
-            "message": "CSV uploaded and processed successfully!",
-            "filename": file.filename,
-            "rows_processed": len(df),
-            "categories": categories,
-            "products": products,
-            "store_names": store_names,
-            # Pass these calculated values back for immediate display if needed
-            "total_quantity": float(total_quantity_calculated),
-            "total_sales": float(total_sales_calculated)
-        }
-
-    except pd.errors.EmptyDataError:
-        print("Error: Empty CSV file.")
-        raise HTTPException(status_code=400, detail="Empty CSV file.")
-    except pd.errors.ParserError as e:
-        print(f"Error parsing CSV file: {e}")
-        raise HTTPException(status_code=400, detail=f"Error parsing CSV file. Check delimiter or file format: {e}")
+    except KeyError as e:
+        logging.error(f"Missing expected column after initial CSV read: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Missing expected column: {e}. Please check your CSV header.")
     except Exception as e:
-        # Catch any other unexpected errors during processing
-        print(f"An unexpected error occurred during CSV upload: {e}") # Log the error for debugging
-        raise HTTPException(status_code=500, detail=f"An unexpected server error occurred during file processing: {e}. If the issue persists, please contact support with your CSV file.")
-
+        logging.error(f"An unexpected error occurred during processing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during processing: {e}")
 
 def get_current_df():
     """Helper function to retrieve the DataFrame or raise an error."""
-    df = df_store.get("current_dashboard_data")
+    # This function expects the data to be stored under the key 'data'
+    df = df_store.get('data')
     if df is None:
-        raise HTTPException(status_code=404, detail="No data uploaded yet. Please upload a CSV file.")
+        raise HTTPException(status_code=404, detail="No CSV data uploaded yet. Please upload a CSV file first.")
     return df.copy() # Return a copy to avoid modifying the original stored DataFrame
 
-@app.get("/data/categories")
-async def get_categories():
-    """Returns a list of unique, standardized categories."""
-    df = get_current_df()
-    return {"categories": df["category"].unique().tolist()}
 
-@app.get("/data/products")
-async def get_products(category: str = Query(None)):
-    """
-    Returns a list of unique products, optionally filtered by standardized category.
-    """
-    df = get_current_df()
-    if category:
-        # Filter by the standardized category
-        df = df[df["category"] == category]
-    return {"products": df["product"].unique().tolist()}
-
-# New endpoint to get unique store names
-@app.get("/data/stores")
-async def get_stores():
-    """Returns a list of unique store names."""
-    df = get_current_df()
-    if "store_name" in df.columns:
-        return {"store_names": df["store_name"].unique().tolist()}
-    return {"store_names": []} # Return empty if column not present
-
-
-@app.get("/data/summary")
+@app.get("/data/summary") # Removed trailing slash
 async def get_summary_data(
     category: str = Query(None),
     product: str = Query(None),
     start_date: date = Query(None),
-    end_date: date = Query(None),
-    store_name: str = Query(None) # New filter for store name
+    end_date: date = Query(None)
 ):
-    """
-    Returns a summary of sales data, filtered by category, product, date range, and store.
-    Aggregates total quantity, total sales, and count of transactions.
-    Also includes sales summaries by category, by product (with quantity and unit), and by unit.
-    """
-    df = get_current_df()
+    df = get_current_df() # Correctly retrieves from 'data'
+    filtered_df = df.copy()
+    logging.info(f"Fetching summary data with filters: category={category}, product={product}, start_date={start_date}, end_date={end_date}")
 
-    # Apply filters
     if category:
-        df = df[df["category"] == category]
+        # Use str.contains with case=False for case-insensitive matching
+        filtered_df = filtered_df[filtered_df['category'].str.contains(category, case=False, na=False)]
     if product:
-        df = df[df["product"] == product]
+        # FIX: Changed 'False' to 'na=False' to resolve positional argument error
+        filtered_df = filtered_df[filtered_df['product'].str.contains(product, case=False, na=False)]
     if start_date:
-        df = df[df["date"].dt.date >= start_date]
+        filtered_df = filtered_df[filtered_df['date'] >= pd.to_datetime(start_date)]
     if end_date:
-        df = df[df["date"].dt.date <= end_date]
-    if store_name and "store_name" in df.columns: # Apply store filter only if column exists
-        df = df[df["store_name"] == store_name]
+        filtered_df = filtered_df[filtered_df['date'] <= pd.to_datetime(end_date)]
 
-    if df.empty:
-        return {
-            "total_quantity": 0,
-            "total_sales": 0,
-            "transaction_count": 0,
-            "message": "No data found for the selected filters.",
-            "summary_by_category": [],
-            "summary_by_product": [],
-            "summary_by_unit": [],
-            "daily_sales_trend": [] # Ensure empty list for charts if no data
-        }
+    if filtered_df.empty:
+        logging.info(f"No data found for the selected filters for summary: category={category}, product={product}, start_date={start_date}, end_date={end_date}")
+        return {"message": "No data found for the selected filters."}
 
-    # Conditional calculation of total_quantity
-    total_quantity = df["quantity"].sum() if "quantity" in df.columns else 0.0
-    total_sales = df["sales"].sum()
-    transaction_count = len(df)
+    total_sales = filtered_df['sales'].sum()
+    total_quantity = filtered_df['quantity'].sum() # This will be 0 if 'quantity' column was missing
+    transaction_count = len(filtered_df) # Assuming each row is a transaction or part of one
 
-    total_quantity_output = float(total_quantity) if pd.notna(total_quantity) else 0.0
-    total_sales_output = float(total_sales) if pd.notna(total_sales) else 0.0
-
-    # Summary by Category (for Pie Chart) - uses the 'category' column
-    summary_by_category_data = df.groupby('category')['sales'].sum().reset_index()
-    summary_by_category_output = summary_by_category_data.to_dict(orient="records")
-
-    # Summary by Product (for Bar Chart) - now includes category, quantity, and unit
-    # Group by product and category to retain category information, and sum both sales and quantity
-    # For unit, take the most frequent unit for that product in the filtered data.
-    summary_by_product_data = df.groupby(['product', 'category']).agg(
+    # Summary by Category
+    summary_by_category = filtered_df.groupby('category').agg(
         sales=('sales', 'sum'),
-        # Conditionally aggregate quantity or default to 0 if column is missing
-        quantity=('quantity', lambda x: x.sum() if "quantity" in df.columns else 0.0),
+        quantity=('quantity', 'sum')
+    ).reset_index().sort_values(by='sales', ascending=False).to_dict(orient='records')
+    logging.info(f"Summary by Category: {summary_by_category}")
+
+
+    # Summary by Product (Top 10)
+    summary_by_product = filtered_df.groupby('product').agg(
+        sales=('sales', 'sum'),
+        quantity=('quantity', 'sum'),
         # Get the most frequent unit for the product. Handles cases where a product might have multiple units.
-        unit=('unit', lambda x: x.mode()[0] if not x.empty and "unit" in df.columns else 'N/A') # Use N/A if unit column not found
-    ).reset_index()
-
-    # Sort by sales in descending order
-    summary_by_product_data = summary_by_product_data.sort_values(by='sales', ascending=False)
-
-    # Apply top 5 filter if no specific product is selected
-    if product is None or product == "": # This means 'All Products' is selected in the frontend dropdown
-        summary_by_product_data = summary_by_product_data.head(5)
-
-    summary_by_product_output = summary_by_product_data.to_dict(orient="records")
+        # Use .mode()[0] for the most frequent, or 'N/A' if empty
+        unit=('unit', lambda x: x.mode()[0] if not x.empty else 'N/A')
+    ).reset_index().sort_values(by='sales', ascending=False)
+    # Re-add category to product summary for consistent coloring on frontend
+    summary_by_product = summary_by_product.merge(df[['product', 'category']].drop_duplicates(), on='product', how='left')
+    summary_by_product = summary_by_product.head(10).to_dict(orient='records')
+    logging.info(f"Summary by Product (Top 10): {summary_by_product}")
 
 
-    # Group by unit and sum sales and quantity
-    unit_sales_summary = df.groupby('unit').agg(
-        # Conditionally aggregate quantity or default to 0 if column is missing
-        total_quantity=('quantity', lambda x: x.sum() if "quantity" in df.columns else 0.0),
-        total_sales=('sales', 'sum')
-    ).reset_index()
-    summary_by_unit_output = unit_sales_summary.to_dict(orient="records")
-
-    # Daily Sales Trend for the main sales chart (Line Chart)
-    # This aggregates sales by date for the selected filters
-    daily_sales_trend_data = df.groupby(df['date'].dt.date)['sales'].sum().reset_index()
-    daily_sales_trend_data.columns = ['date', 'sales']
-    # Convert date objects to string for JSON serialization
-    daily_sales_trend_data['date'] = daily_sales_trend_data['date'].astype(str)
-    daily_sales_trend_output = daily_sales_trend_data.to_dict(orient="records")
+    # Summary by Unit (if 'unit' column exists)
+    summary_by_unit = []
+    if 'unit' in filtered_df.columns:
+        # Group by the original 'unit' column if it exists and is meaningful
+        # Only include rows where 'unit' is not NaN or empty
+        unit_df = filtered_df.dropna(subset=['unit']).copy()
+        if not unit_df.empty:
+            summary_by_unit = unit_df.groupby('unit').agg(
+                total_sales=('sales', 'sum'),
+                total_quantity=('quantity', 'sum')
+            ).reset_index().sort_values(by='total_sales', ascending=False).to_dict(orient='records')
+        else:
+            # Fallback if no explicit 'unit' column or it's all empty
+            # Use extract_pack_size to derive units if product names have them
+            filtered_df[['pack_size_label', 'derived_unit_value']] = filtered_df['product'].apply(extract_pack_size).apply(pd.Series)
+            # Filter out 'Unknown' or 'Standard Pack' if they are too generic
+            derived_unit_df = filtered_df[~filtered_df['pack_size_label'].isin(["Unknown", "Standard Pack"])].copy() # Updated filter
+            if not derived_unit_df.empty:
+                summary_by_unit = derived_unit_df.groupby('pack_size_label').agg(
+                    total_sales=('sales', 'sum'),
+                    total_quantity=('quantity', 'sum') # This would be total packs, not derived units for this grouping
+                ).reset_index().sort_values(by='total_sales', ascending=False).to_dict(orient='records')
+    logging.info(f"Summary by Unit: {summary_by_unit}")
 
 
     return {
-        "total_quantity": total_quantity_output,
-        "total_sales": total_sales_output,
+        "total_sales": total_sales,
+        "total_quantity": total_quantity,
         "transaction_count": transaction_count,
-        "summary_by_category": summary_by_category_output,
-        "summary_by_product": summary_by_product_output,
-        "summary_by_unit": summary_by_unit_output,
-        "daily_sales_trend": daily_sales_trend_output # New: Daily sales trend
+        "summary_by_category": summary_by_category,
+        "summary_by_product": summary_by_product,
+        "summary_by_unit": summary_by_unit
     }
 
-@app.get("/data/monthly-sales-trend")
+@app.get("/data/products") # Removed trailing slash
+async def get_products(category: str = Query(None)):
+    df = get_current_df() # Correctly retrieves from 'data'
+    filtered_df = df.copy()
+    if category:
+        # Use str.contains with case=False for case-insensitive matching
+        filtered_df = filtered_df[filtered_df['category'].str.contains(category, case=False, na=False)]
+
+    products = sorted(filtered_df['product'].dropna().unique().tolist())
+    logging.info(f"Fetched products for category '{category}': {products}")
+    return {"products": products}
+
+
+@app.get("/data/monthly-sales-trend") # Removed trailing slash
 async def get_monthly_sales_trend(
     start_date: date = Query(None),
-    end_date: date = Query(None),
-    store_name: str = Query(None) # New filter for store name
+    end_date: date = Query(None)
 ):
-    """
-    Returns month-wise sales trend for the top 5 products, optionally filtered by date range and store.
-    """
-    df = get_current_df()
+    df = get_current_df() # Correctly retrieves from 'data'
+    filtered_df = df.copy()
+    logging.info(f"Fetching monthly sales trend with filters: start_date={start_date}, end_date={end_date}")
 
-    # Apply date and store filters
+
     if start_date:
-        df = df[df["date"].dt.date >= start_date]
+        filtered_df = filtered_df[filtered_df['date'] >= pd.to_datetime(start_date)]
     if end_date:
-        df = df[df["date"].dt.date <= end_date]
-    if store_name and "store_name" in df.columns:
-        df = df[df["store_name"] == store_name]
+        filtered_df = filtered_df[filtered_df['date'] <= pd.to_datetime(end_date)]
 
-    if df.empty:
-        return {
-            "months": [],
-            "products_sales_data": [],
-            "message": "No data found for the selected filters."
-        }
+    if filtered_df.empty:
+        logging.info("No data found for the selected filters for monthly sales trend.")
+        return {"months": [], "products_sales_data": []}
 
-    # Ensure 'date' column is datetime and extract month-year for grouping
-    # Convert Period to string for consistent JSON serialization and frontend display
-    df['month_year'] = df['date'].dt.to_period('M').astype(str)
-
-    # Calculate total sales for each product to determine top 5 within the filtered timeframe
-    product_total_sales = df.groupby('product')['sales'].sum().reset_index()
+    # Identify top 5 products by total sales within the filtered timeframe
+    product_total_sales = filtered_df.groupby('product')['sales'].sum().reset_index()
     product_total_sales = product_total_sales.sort_values(by='sales', ascending=False)
     top_5_products_names = product_total_sales.head(5)['product'].tolist()
+    logging.info(f"Top 5 products for monthly trend: {top_5_products_names}")
+
 
     # Filter original (date-filtered) DataFrame for only the top 5 products
-    df_top_5 = df[df['product'].isin(top_5_products_names)]
+    df_top_5 = filtered_df[filtered_df['product'].isin(top_5_products_names)]
 
     # Get all unique month_year periods in the filtered data to use as labels
     all_months = sorted(df_top_5['month_year'].unique().tolist())
+    logging.info(f"All months in filtered data: {all_months}")
 
     products_sales_data = []
     # For each of the top 5 products, get their sales for each month
@@ -487,11 +479,71 @@ async def get_monthly_sales_trend(
 
         products_sales_data.append({
             "product_name": product_name,
-            "category": category,
+            "category": category, # Include category for frontend coloring
             "sales_data": temp_series.tolist()
         })
+    logging.info("Monthly sales data prepared.")
+
+    return {"months": all_months, "products_sales_data": products_sales_data}
+
+
+@app.get("/data/category-specific-summary") # Removed trailing slash
+async def get_category_specific_summary(
+    category: str = Query(...), # Category is now a mandatory parameter
+    start_date: date = Query(None),
+    end_date: date = Query(None)
+):
+    df = get_current_df() # FIX: Changed from df_store.get('data') to get_current_df()
+    logging.info(f"Fetching category-specific summary for '{category}' with filters: start_date={start_date}, end_date={end_date}")
+
+    # Filter by the requested category using case-insensitive contains
+    category_df = df[df['category'].str.contains(category, case=False, na=False)].copy() 
+
+    if start_date:
+        category_df = category_df[category_df['date'] >= pd.to_datetime(start_date)]
+    if end_date:
+        category_df = category_df[category_df['date'] <= pd.to_datetime(end_date)]
+
+    if category_df.empty:
+        logging.info(f"Category-specific summary: No data found for category '{category}' with selected date filters after filtering by case-insensitive category match.")
+        return {"variety_summary": [], "pack_size_summary": []}
+
+    # Apply variety and pack size extraction
+    category_df['parsed_variety'] = category_df.apply(lambda row: extract_variety(row['product'], row['category']), axis=1)
+    # Apply pack size extraction and expand to two new columns
+    category_df[['pack_size_label', 'derived_unit_value']] = category_df['product'].apply(extract_pack_size).apply(pd.Series)
+
+    # Calculate "Derived Units Sold" for Variety Summary: quantity * derived_unit_value
+    # Ensure 'quantity' and 'derived_unit_value' are numeric and handle potential non-numeric values
+    category_df['quantity'] = pd.to_numeric(category_df['quantity'], errors='coerce').fillna(0)
+    category_df['derived_unit_value'] = pd.to_numeric(category_df['derived_unit_value'], errors='coerce').fillna(0)
+    
+    # If derived_unit_value is 0 (meaning no specific quantifiable unit was found from product name),
+    # assume each 'quantity' represents 1 derived unit. This is crucial for "pack" or "piece" items.
+    category_df['total_derived_units_sold'] = category_df.apply(
+        lambda row: row['quantity'] * row['derived_unit_value'] if row['derived_unit_value'] > 0 else row['quantity'],
+        axis=1
+    )
+    
+    # Summary by Variety
+    variety_summary = category_df.groupby('parsed_variety').agg(
+        total_sales=('sales', 'sum'),
+        total_derived_units_sold=('total_derived_units_sold', 'sum')
+    ).reset_index().sort_values(by='total_sales', ascending=False).to_dict(orient='records')
+
+    # Summary by Pack Size
+    # For pack size, 'total_packs_sold' is just the sum of 'quantity' for that pack_size_label
+    pack_size_summary = category_df.groupby('pack_size_label').agg(
+        total_sales=('sales', 'sum'),
+        total_packs_sold=('quantity', 'sum'),
+        total_derived_units_from_packs=('total_derived_units_sold', 'sum')
+    ).reset_index().sort_values(by='total_sales', ascending=False).to_dict(orient='records')
+
+    logging.info(f"Category '{category}' variety summary: {variety_summary}")
+    logging.info(f"Category '{category}' pack size summary: {pack_size_summary}")
 
     return {
-        "months": all_months,
-        "products_sales_data": products_sales_data
+        "variety_summary": variety_summary,
+        "pack_size_summary": pack_size_summary
     }
+
